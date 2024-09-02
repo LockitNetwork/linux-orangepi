@@ -1,0 +1,19 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "rockchip,rk3588s-orangepi-5";
+	fragment@0 {
+		target = <&uart4>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-0 = <&uart4m0_xfer>;
+
+			vcb2-pm {
+				status = "okay";
+				compatible = "viv,vcb2-pm";
+			};
+		};
+	};
+};
+
