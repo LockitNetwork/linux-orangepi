@@ -24,6 +24,7 @@ struct vcb2_pm_status_parser {
 	enum {
 		PARSER_STATE_INIT,
 		PARSER_STATE_SHUTDOWN_CONFIRM,
+		PARSER_STATE_PING_CONFIRM,
 		PARSER_STATE_COMMA,
 		PARSER_STATE_PERCENT,
 	} state;
@@ -40,6 +41,7 @@ static void vcb2_pm_status_parser_init(struct vcb2_pm_status_parser *p)
 enum vcb2_pm_status_parser_ret {
 	PARSER_RET_COMPLETE_STATUS,
 	PARSER_RET_COMPLETE_SHUTDOWN_REQUEST,
+	PARSER_RET_COMPLETE_PING,
 	PARSER_RET_INCOMPLETE,
 	PARSER_RET_ERROR,
 };
@@ -48,9 +50,10 @@ enum vcb2_pm_status_parser_ret {
  * Simple state machine parser for the serial messages from PM.
  * 
  * Gramma (PEG):
- * message <- (power_status / shutdown_request) '\n'
+ * message <- (power_status / shutdown_request / ping) '\n'
  * power_status <- ext_power_online ',' bat_percent
  * shutdown_request <- 's'
+ * ping <- 'p'
  * ext_power_online <- '0' / '1'
  * bat_percent <- [0-9]*
  * 
@@ -77,6 +80,9 @@ vcb2_pm_status_parser_feed(struct vcb2_pm_status_parser *p, const char c)
 		case 's':
 			p->state = PARSER_STATE_SHUTDOWN_CONFIRM;
 			break;
+		case 'p':
+			p->state = PARSER_STATE_PING_CONFIRM;
+			break;
 		default:
 			goto err;
 		}
@@ -85,6 +91,13 @@ vcb2_pm_status_parser_feed(struct vcb2_pm_status_parser *p, const char c)
 		if (c == '\n') {
 			p->state = PARSER_STATE_INIT;
 			return PARSER_RET_COMPLETE_SHUTDOWN_REQUEST;
+		} else {
+			goto err;
+		}
+	case PARSER_STATE_PING_CONFIRM:
+		if (c == '\n') {
+			p->state = PARSER_STATE_INIT;
+			return PARSER_RET_COMPLETE_PING;
 		} else {
 			goto err;
 		}
@@ -307,6 +320,18 @@ static int vcb2_pm_serial_recv(struct serdev_device *serdev,
 			mutex_lock(&di->lock);
 			initiate_shutdown_unlocked(di);
 			mutex_unlock(&di->lock);
+			break;
+		case PARSER_RET_COMPLETE_PING:
+			static const char ping_msg[] = { 'p', '\n' };
+
+			dev_info(&serdev->dev, "ping received\n");
+			ret = serdev_device_write(
+				di->serdev, ping_msg, sizeof(ping_msg),
+				msecs_to_jiffies(SERIAL_TIMEOUT_MS));
+
+			if (ret != sizeof(ping_msg))
+				dev_err(&serdev->dev, "failed to send pong\n");
+
 			break;
 		}
 	}
