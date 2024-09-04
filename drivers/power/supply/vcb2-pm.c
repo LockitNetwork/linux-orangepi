@@ -380,18 +380,18 @@ static ssize_t show_shutdown_requested(struct device *dev,
 int vcb2_pm_sys_off_handler(struct sys_off_data *data)
 {
 	static const char shutdown_msg[] = { 'o', 'f', 'f', '\n' };
+	struct serdev_device *serdev;
 	int ret;
-	struct vcb2_pm_device_info *di;
 
-	di = data->cb_data;
-	ret = serdev_device_write(di->serdev, shutdown_msg,
-				  sizeof(shutdown_msg), msecs_to_jiffies(1000));
+	serdev = data->cb_data;
+	ret = serdev_device_write(serdev, shutdown_msg, sizeof(shutdown_msg),
+				  msecs_to_jiffies(1000));
 
 	if (ret != sizeof(shutdown_msg)) {
-		dev_err(&di->serdev->dev, "error sending shutdown message\n");
+		dev_err(&serdev->dev, "error sending shutdown message\n");
 	}
 
-	serdev_device_wait_until_sent(di->serdev,
+	serdev_device_wait_until_sent(serdev,
 				      msecs_to_jiffies(SERIAL_TIMEOUT_MS));
 
 	return NOTIFY_DONE;
@@ -515,8 +515,11 @@ static int vcb2_pm_probe(struct serdev_device *serdev)
 		goto err;
 	}
 
-	ret = devm_register_power_off_handler(&serdev->dev,
-					      vcb2_pm_sys_off_handler, di);
+	ret = devm_register_sys_off_handler(&serdev->dev,
+					    SYS_OFF_MODE_POWER_OFF_PREPARE,
+					    SYS_OFF_PRIO_DEFAULT,
+					    vcb2_pm_sys_off_handler, serdev);
+
 	if (ret) {
 		dev_err(&serdev->dev, "error registering power off handler\n");
 		goto err;
