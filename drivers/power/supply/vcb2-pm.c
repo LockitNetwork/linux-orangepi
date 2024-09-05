@@ -210,6 +210,9 @@ static void initiate_shutdown_unlocked(struct vcb2_pm_device_info *di)
 {
 	WARN_ON(!mutex_is_locked(&di->lock));
 
+	if (di->shutdown_requested)
+		return;
+
 	di->shutdown_requested = true;
 	timer_setup(&di->graceful_shutdown_timer, run_userspace_poweroff, 0);
 	mod_timer(&di->graceful_shutdown_timer,
