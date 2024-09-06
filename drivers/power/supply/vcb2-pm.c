@@ -11,8 +11,6 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 
-#define PM_STATUS_BATTERY_LEVEL_BITS 0x7f
-#define PM_STATUS_ONLINE_BITS (1 << 7)
 #define PM_STATUS_CACHE_PERIOD_MS 100
 
 #define SERIAL_BAUDRATE 115200
@@ -20,114 +18,47 @@
 
 #define GRACEFUL_SHUTDOWN_MS 20000
 
+enum vcb2_pm_charge_status {
+	CHARGE_STATUS_NOT_CHARGING,
+	CHARGE_STATUS_CHARGING,
+	CHARGE_STATUS_FULL,
+};
+
+struct vcb2_pm_status {
+	enum vcb2_pm_charge_status charge_status;
+	u16 bat_voltage;
+	u16 bat_current;
+	u8 bat_percent;
+	bool online;
+};
+
+void vcb2_pm_status_init(struct vcb2_pm_status *status)
+{
+	status->online = false;
+	status->charge_status = CHARGE_STATUS_NOT_CHARGING;
+	status->bat_percent = 0;
+	status->bat_voltage = 0;
+	status->bat_current = 0;
+}
+
 struct vcb2_pm_status_parser {
 	enum {
 		PARSER_STATE_INIT,
 		PARSER_STATE_SHUTDOWN_CONFIRM,
 		PARSER_STATE_PING_CONFIRM,
-		PARSER_STATE_COMMA,
+		PARSER_STATE_CHARGE_STATUS,
 		PARSER_STATE_PERCENT,
+		PARSER_STATE_VOLTAGE,
+		PARSER_STATE_CURRENT,
 	} state;
 
-	u8 status;
+	struct vcb2_pm_status status;
 };
 
 static void vcb2_pm_status_parser_init(struct vcb2_pm_status_parser *p)
 {
 	p->state = PARSER_STATE_INIT;
-	p->status = 0;
-}
-
-enum vcb2_pm_status_parser_ret {
-	PARSER_RET_COMPLETE_STATUS,
-	PARSER_RET_COMPLETE_SHUTDOWN_REQUEST,
-	PARSER_RET_COMPLETE_PING,
-	PARSER_RET_INCOMPLETE,
-	PARSER_RET_ERROR,
-};
-
-/*
- * Simple state machine parser for the serial messages from PM.
- * 
- * Gramma (PEG):
- * message <- (power_status / shutdown_request / ping) '\n'
- * power_status <- ext_power_online ',' bat_percent
- * shutdown_request <- 's'
- * ping <- 'p'
- * ext_power_online <- '0' / '1'
- * bat_percent <- [0-9]*
- * 
- * Percent values are not validated. Values outside of the allowed
- * range (0-100) are subject to unsigned integer overflow.
- * Empty percent value is treated as 0.
- */
-static enum vcb2_pm_status_parser_ret
-vcb2_pm_status_parser_feed(struct vcb2_pm_status_parser *p, const char c)
-{
-	u8 percent;
-
-	switch (p->state) {
-	case PARSER_STATE_INIT:
-		switch (c) {
-		case '0':
-			p->status = 0;
-			p->state = PARSER_STATE_COMMA;
-			break;
-		case '1':
-			p->status = PM_STATUS_ONLINE_BITS;
-			p->state = PARSER_STATE_COMMA;
-			break;
-		case 's':
-			p->state = PARSER_STATE_SHUTDOWN_CONFIRM;
-			break;
-		case 'p':
-			p->state = PARSER_STATE_PING_CONFIRM;
-			break;
-		default:
-			goto err;
-		}
-		break;
-	case PARSER_STATE_SHUTDOWN_CONFIRM:
-		if (c == '\n') {
-			p->state = PARSER_STATE_INIT;
-			return PARSER_RET_COMPLETE_SHUTDOWN_REQUEST;
-		} else {
-			goto err;
-		}
-	case PARSER_STATE_PING_CONFIRM:
-		if (c == '\n') {
-			p->state = PARSER_STATE_INIT;
-			return PARSER_RET_COMPLETE_PING;
-		} else {
-			goto err;
-		}
-	case PARSER_STATE_COMMA:
-		if (c == ',')
-			p->state = PARSER_STATE_PERCENT;
-		else
-			goto err;
-		break;
-	case PARSER_STATE_PERCENT:
-		if (c >= '0' && c <= '9') {
-			percent = p->status & PM_STATUS_BATTERY_LEVEL_BITS;
-			percent = (percent * 10) + (u8)(c - '0');
-			p->status =
-				(p->status & ~PM_STATUS_BATTERY_LEVEL_BITS) |
-				percent;
-		} else if (c == '\n') {
-			p->state = PARSER_STATE_INIT;
-			return PARSER_RET_COMPLETE_STATUS;
-		} else {
-			goto err;
-		}
-		break;
-	}
-
-	return PARSER_RET_INCOMPLETE;
-
-err:
-	p->state = PARSER_STATE_INIT;
-	return PARSER_RET_ERROR;
+	vcb2_pm_status_init(&p->status);
 }
 
 enum vcb2_pm_poll_state {
@@ -151,10 +82,7 @@ struct vcb2_pm_device_info {
 
 	enum vcb2_pm_poll_state poll_state;
 	struct vcb2_pm_status_parser status_parser;
-
-	u8 pm_status; /* [7]   = ext. power online flag
-	               * [6:0] = battery level in percent
-                       */
+	struct vcb2_pm_status pm_status;
 
 	bool shutdown_requested;
 };
@@ -165,12 +93,136 @@ static void vcb2_pm_di_init(struct vcb2_pm_device_info *di)
 	di->psy = NULL;
 	di->poll_state = POLL_STATE_ERROR;
 	di->poll_time = 0;
-	di->pm_status = 0;
 	di->shutdown_requested = false;
 
 	mutex_init(&di->lock);
 	init_waitqueue_head(&di->wq);
 	vcb2_pm_status_parser_init(&di->status_parser);
+	vcb2_pm_status_init(&di->pm_status);
+}
+
+static int parse_charge_status(char c)
+{
+	switch (c) {
+	case 'n':
+		return CHARGE_STATUS_NOT_CHARGING;
+	case 'c':
+		return CHARGE_STATUS_CHARGING;
+	case 'f':
+		return CHARGE_STATUS_FULL;
+	}
+	return -1;
+}
+
+enum vcb2_pm_status_parser_ret {
+	PARSER_RET_COMPLETE_STATUS,
+	PARSER_RET_COMPLETE_SHUTDOWN_REQUEST,
+	PARSER_RET_COMPLETE_PING,
+	PARSER_RET_INCOMPLETE,
+	PARSER_RET_ERROR,
+};
+
+/*
+ * Simple state machine parser for the serial messages from PM.
+ * 
+ * Gramma (PEG):
+ * message <- (power_status / shutdown_request / ping) '\n'
+ * power_status <- online charge_status bat_percent ',' voltage ',' current
+ * shutdown_request <- 's'
+ * ping <- 'p'
+ * online <- '0' / '1'
+ * charge_status <- 'n' / 'c' / 'f'
+ * bat_percent <- uint
+ * voltage <- uint
+ * current <- uint
+ * uint <- [0-9]*
+ * 
+ * Numerical values are not validated. Values outside of the allowed
+ * range are subject to unsigned integer overflow.
+ * Empty numerical values are treated as 0.
+ */
+static enum vcb2_pm_status_parser_ret
+vcb2_pm_status_parser_feed(struct vcb2_pm_status_parser *p, const char c)
+{
+	enum vcb2_pm_status_parser_ret ret = PARSER_RET_INCOMPLETE;
+
+	switch (p->state) {
+	case PARSER_STATE_INIT:
+		switch (c) {
+		case '0':
+			vcb2_pm_status_init(&p->status);
+			p->status.online = false;
+			p->state = PARSER_STATE_CHARGE_STATUS;
+			break;
+		case '1':
+			vcb2_pm_status_init(&p->status);
+			p->status.online = true;
+			p->state = PARSER_STATE_CHARGE_STATUS;
+			break;
+		case 's':
+			p->state = PARSER_STATE_SHUTDOWN_CONFIRM;
+			break;
+		case 'p':
+			p->state = PARSER_STATE_PING_CONFIRM;
+			break;
+		default:
+			ret = PARSER_RET_ERROR;
+		}
+		break;
+	case PARSER_STATE_SHUTDOWN_CONFIRM:
+		if (c == '\n')
+			ret = PARSER_RET_COMPLETE_SHUTDOWN_REQUEST;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_PING_CONFIRM:
+		if (c == '\n')
+			ret = PARSER_RET_COMPLETE_PING;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_CHARGE_STATUS:
+		int charge_status = parse_charge_status(c);
+		if (charge_status < 0) {
+			ret = PARSER_RET_ERROR;
+		} else {
+			p->status.charge_status = charge_status;
+			p->state = PARSER_STATE_PERCENT;
+		}
+		break;
+	case PARSER_STATE_PERCENT:
+		if (c >= '0' && c <= '9')
+			p->status.bat_percent =
+				(p->status.bat_percent * 10) + (u8)(c - '0');
+		else if (c == ',')
+			p->state = PARSER_STATE_VOLTAGE;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_VOLTAGE:
+		if (c >= '0' && c <= '9')
+			p->status.bat_voltage =
+				(p->status.bat_voltage * 10) + (u16)(c - '0');
+		else if (c == ',')
+			p->state = PARSER_STATE_CURRENT;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	case PARSER_STATE_CURRENT:
+		if (c >= '0' && c <= '9')
+			p->status.bat_current =
+				(p->status.bat_current * 10) + (u16)(c - '0');
+		else if (c == '\n')
+			ret = PARSER_RET_COMPLETE_STATUS;
+		else
+			ret = PARSER_RET_ERROR;
+		break;
+	}
+
+	if (ret != PARSER_RET_INCOMPLETE)
+		p->state = PARSER_STATE_INIT;
+
+	return ret;
 }
 
 static inline bool
@@ -220,7 +272,7 @@ static void initiate_shutdown_unlocked(struct vcb2_pm_device_info *di)
 }
 
 static int vcb2_pm_await_poll_response(struct vcb2_pm_device_info *di,
-				       u8 *status)
+				       struct vcb2_pm_status *status)
 {
 	long ret;
 
@@ -249,7 +301,8 @@ static int vcb2_pm_await_poll_response(struct vcb2_pm_device_info *di,
 	return 0;
 }
 
-static int vcb2_pm_poll(struct vcb2_pm_device_info *di, u8 *status)
+static int vcb2_pm_poll(struct vcb2_pm_device_info *di,
+			struct vcb2_pm_status *status)
 {
 	static const char poll_msg[] = { 'p', 'o', 'l', 'l', '\n' };
 	int ret;
@@ -350,8 +403,8 @@ static int vcb2_pm_psy_get_property(struct power_supply *psy,
 				    union power_supply_propval *val)
 {
 	struct vcb2_pm_device_info *di;
+	struct vcb2_pm_status pm_status;
 	int res;
-	u8 pm_status;
 
 	di = power_supply_get_drvdata(psy);
 	res = vcb2_pm_poll(di, &pm_status);
@@ -359,11 +412,48 @@ static int vcb2_pm_psy_get_property(struct power_supply *psy,
 		return res;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+		if (pm_status.online) {
+			switch (pm_status.charge_status) {
+			case CHARGE_STATUS_NOT_CHARGING:
+				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+				break;
+			case CHARGE_STATUS_CHARGING:
+				val->intval = POWER_SUPPLY_STATUS_CHARGING;
+				break;
+			case CHARGE_STATUS_FULL:
+				val->intval = POWER_SUPPLY_STATUS_FULL;
+				break;
+			default:
+				return -EINVAL;
+			}
+		} else {
+			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		}
+		break;
 	case POWER_SUPPLY_PROP_ONLINE:
-		val->intval = !!(pm_status & PM_STATUS_ONLINE_BITS);
+		val->intval = pm_status.online;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-		val->intval = pm_status & PM_STATUS_BATTERY_LEVEL_BITS;
+		val->intval = pm_status.bat_percent;
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+		if (pm_status.bat_percent >= 90)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+		else if (pm_status.bat_percent >= 70)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
+		else if (pm_status.bat_percent >= 40)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+		else if (pm_status.bat_percent >= 10)
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+		else
+			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		val->intval = pm_status.bat_voltage * 1000;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		val->intval = pm_status.bat_current * 1000;
 		break;
 	default:
 		return -EINVAL;
@@ -465,7 +555,9 @@ static int vcb2_pm_setup_psy(struct vcb2_pm_device_info *di)
 
 	/* Standard properties */
 	static enum power_supply_property psy_props[] = {
-		POWER_SUPPLY_PROP_ONLINE, POWER_SUPPLY_PROP_CAPACITY
+		POWER_SUPPLY_PROP_STATUS,      POWER_SUPPLY_PROP_ONLINE,
+		POWER_SUPPLY_PROP_CAPACITY,    POWER_SUPPLY_PROP_CAPACITY_LEVEL,
+		POWER_SUPPLY_PROP_VOLTAGE_NOW, POWER_SUPPLY_PROP_CURRENT_NOW,
 	};
 
 	struct power_supply_config psy_cfg = {
